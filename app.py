@@ -1,157 +1,196 @@
-"""Test Equity - Cash Application report updater (Streamlit)."""
+"""Test Equity - Cash Application Specialist: EOD loader (Streamlit)."""
 import base64
 import datetime as dt
+import hmac
 
 import requests
 import streamlit as st
 
-import ca_report as C
+import cash_report as cr
 
-st.set_page_config(page_title="Cash Application Report", page_icon="📊", layout="centered")
-st.title("Cash Application – daily report update")
-
-# ------------------------------------------------------------------ password gate
-PW = st.secrets.get("APP_PASSWORD", "")
-if PW:
-    if not st.session_state.get("ok"):
-        typed = st.text_input("Password", type="password")
-        if typed:
-            if typed == PW:
-                st.session_state["ok"] = True
-                st.rerun()
-            else:
-                st.error("Wrong password.")
-        st.stop()
-
-# ------------------------------------------------------------------ GitHub helpers
-GH = st.secrets.get("GITHUB", None)
+st.set_page_config(page_title="Cash Application - EOD loader", page_icon=":material/payments:", layout="centered")
 
 
-def gh_parts():
-    headers = {"Authorization": f"Bearer {GH['token']}", "X-GitHub-Api-Version": "2022-11-28"}
-    url = f"https://api.github.com/repos/{GH['repo']}/contents/{GH['path']}"
-    params = {"ref": GH.get("branch", "main")}
-    return headers, url, params
+# ---------------------------------------------------------------- secrets / password
+def secret(name, default=None):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:  # no secrets file at all
+        return default
 
 
-def fetch_latest():
-    """Always downloads the newest copy, so two people can never work on an old version."""
-    headers, url, params = gh_parts()
-    meta = requests.get(url, headers=headers, params=params, timeout=60)
-    if meta.status_code != 200:
-        try:
-            msg = meta.json().get("message")
-        except Exception:  # noqa
-            msg = meta.text[:100]
-        return None, None, (f"GitHub replied {meta.status_code}: {msg}. "
-                            "Check the token, repo name and file name in Secrets.")
-    raw = requests.get(url, headers={**headers, "Accept": "application/vnd.github.raw+json"},
-                       params=params, timeout=300)
-    if raw.status_code != 200:
-        return None, None, f"Could not download the report (GitHub replied {raw.status_code})."
-    return raw.content, meta.json()["sha"], None
-
-
-# ------------------------------------------------------------------ check the connection once
-manual_master = None
-if GH:
-    if "gh_checked" not in st.session_state:
-        with st.spinner("Checking the connection to GitHub..."):
-            headers, url, params = gh_parts()
-            chk = requests.get(url, headers=headers, params=params, timeout=60)
-        if chk.status_code != 200:
-            try:
-                msg = chk.json().get("message")
-            except Exception:  # noqa
-                msg = chk.text[:100]
-            st.error(f"GitHub replied {chk.status_code}: {msg}. "
-                     "Check the token, repo name and file name in Secrets.")
-            st.stop()
-        st.session_state["gh_checked"] = True
-    st.caption("Connected to GitHub. The newest report is downloaded when you click Update report.")
-else:
-    up = st.file_uploader("Current report (.xlsx)", type="xlsx")
-    manual_master = up.getvalue() if up else None
-    if manual_master is None:
-        st.info("Upload the current report to start. (Secrets are not set, so GitHub is not used.)")
-        st.stop()
-
-# ------------------------------------------------------------------ EOD files
-st.subheader("1. Select the agents' EOD files")
-st.write("Select **both** files together (hold Ctrl and click each file).")
-eods = st.file_uploader("EOD files", type="xlsx", accept_multiple_files=True)
-if not eods:
+APP_PASSWORD = secret("APP_PASSWORD")
+if not APP_PASSWORD:
+    st.error("APP_PASSWORD is missing in the app's Secrets. Add it (Manage app > Settings > Secrets) and reload.")
     st.stop()
 
-files = [(f.name, f.getvalue()) for f in eods]
-summary, pwarn, perr = C.preview(files)
+if not st.session_state.get("authed"):
+    st.title("Cash Application - EOD loader")
+    pw = st.text_input("Password", type="password")
+    if pw:
+        if hmac.compare_digest(pw.encode(), str(APP_PASSWORD).encode()):
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("Wrong password.")
+    st.stop()
 
-st.subheader("2. Check what was found")
-for e in perr:
-    st.error(e)
-for w in pwarn:
-    st.warning(w)
-if summary:
-    st.table([{"EOD sheet": a, "Agent": b, "Date": c, "Rows": n} for a, b, c, n in summary])
-    st.caption("The date and agent come from inside each file. Month and Week are filled in automatically.")
+GH = secret("GITHUB")
+GH = dict(GH) if GH else None
 
-go = st.button("Update report", type="primary", disabled=bool(perr) or not summary)
 
-if go:
-    st.session_state.pop("result", None)
-    sha = None
+# ---------------------------------------------------------------- GitHub helpers
+def gh_headers(raw=False):
+    h = {"Authorization": f"Bearer {GH['token']}", "X-GitHub-Api-Version": "2022-11-28"}
+    h["Accept"] = "application/vnd.github.raw+json" if raw else "application/vnd.github+json"
+    return h
+
+
+def gh_url():
+    return f"https://api.github.com/repos/{GH['repo']}/contents/{GH['path']}"
+
+
+def gh_load():
+    """Return (bytes, sha) of the report in the private repo, or stop with a clear message."""
+    p = {"ref": GH.get("branch", "main")}
+    meta = requests.get(gh_url(), headers=gh_headers(), params=p, timeout=60)
+    if meta.status_code != 200:
+        try:
+            why = meta.json().get("message")
+        except Exception:
+            why = meta.text[:200]
+        st.error(f"GitHub replied {meta.status_code}: {why}. "
+                 "Check the token, repo name and file name in Secrets.")
+        st.stop()
+    sha = meta.json()["sha"]
+    r = requests.get(gh_url(), headers=gh_headers(raw=True), params=p, timeout=180)
+    if r.status_code != 200:
+        st.error(f"GitHub could not send the file (status {r.status_code}).")
+        st.stop()
+    return r.content, sha
+
+
+def gh_save(data, sha, message):
+    body = {"message": message, "content": base64.b64encode(data).decode(),
+            "sha": sha, "branch": GH.get("branch", "main")}
+    r = requests.put(gh_url(), headers=gh_headers(), json=body, timeout=300)
+    if r.status_code in (200, 201):
+        return r.json()["content"]["sha"], None
+    try:
+        why = r.json().get("message")
+    except Exception:
+        why = r.text[:200]
+    return None, f"GitHub replied {r.status_code}: {why}"
+
+
+# ---------------------------------------------------------------- load the master report
+st.title("Cash Application - EOD loader")
+st.caption("Test Equity - Cash Application Specialist report")
+
+if "master" not in st.session_state:
     if GH:
-        with st.spinner("Downloading the newest report from GitHub..."):
-            master, sha, err = fetch_latest()
-        if err:
-            st.error(err)
-            st.stop()
+        with st.spinner("Loading the current report from GitHub..."):
+            st.session_state["master"], st.session_state["sha"] = gh_load()
     else:
-        master = manual_master
+        st.session_state["master"], st.session_state["sha"] = None, None
 
-    with st.spinner("Updating the report (about 10-20 seconds)..."):
-        res = C.process(master, files)
-
-    if not res["ok"]:
-        for e in res["errors"]:
-            st.error(e)
-        for w in res["warnings"]:
-            st.warning(w)
+if GH:
+    c1, c2 = st.columns([4, 1])
+    c1.write(f"Report loaded from GitHub ({len(st.session_state['master']) / 1e6:.1f} MB).")
+    if c2.button("Reload"):
+        for k in ("master", "sha", "result"):
+            st.session_state.pop(k, None)
+        st.rerun()
+else:
+    up = st.file_uploader("Current report (.xlsx) - local mode, nothing is saved to GitHub", type="xlsx", key="master_up")
+    if up:
+        st.session_state["master"] = up.getvalue()
+    if not st.session_state.get("master"):
+        st.info("Upload the current report to continue.")
         st.stop()
 
-    for m in res["messages"]:
-        st.success(m)
-    for w in res["warnings"]:
-        st.warning(w)
-    st.session_state["result"] = res["new_bytes"]
+# ---------------------------------------------------------------- upload the EOD files
+st.subheader("1. Select the agents' EOD files")
+st.caption("Select both agents' files together (hold Ctrl and click each one).")
+files = st.file_uploader("EOD files (.xlsx)", type="xlsx", accept_multiple_files=True, key="eod_files")
 
-    if GH:
-        headers, url, params = gh_parts()
-        with st.spinner("Saving back to GitHub. Wait for the green message..."):
-            body = {
-                "message": "EOD update " + dt.date.today().isoformat(),
-                "content": base64.b64encode(res["new_bytes"]).decode(),
-                "sha": sha,
-                "branch": GH.get("branch", "main"),
-            }
-            put = requests.put(url, headers=headers, json=body, timeout=300)
-        if put.status_code in (200, 201):
-            st.success("Saved back to GitHub. You can now download the report below.")
-        else:
-            try:
-                msg = put.json().get("message")
-            except Exception:  # noqa
-                msg = put.text[:100]
-            st.error(f"Could NOT save to GitHub (reply {put.status_code}: {msg}). "
-                     "Download the report below and keep it, and tell the owner before loading anything else.")
+parsed = []
+if files:
+    for f in files:
+        parsed.append(cr.parse_eod(f.name, f.getvalue()))
+    for p in parsed:
+        for w in p["warnings"]:
+            st.warning(w)
+    table = cr.preview(parsed)
+    if table:
+        st.dataframe(table, hide_index=True)
 
-if st.session_state.get("result"):
-    st.subheader("3. Download")
-    st.download_button(
-        "Download updated report",
-        data=st.session_state["result"],
-        file_name="Test Equity - Cash Application Specialist - " + dt.date.today().strftime("%d-%b-%Y") + ".xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    st.info("Open it in Excel. Excel recalculates the Daily, Weekly and month sheets when it opens, "
-            "so the first open may take a few seconds.")
+    detected = cr.detect_date(parsed)
+    dates = sorted({r["date"] for p in parsed for sh in p["sheets"] for r in sh["rows"] if r["date"]})
+    st.subheader("2. Check the date")
+    if len(dates) > 1:
+        st.warning("The files contain more than one date: " + ", ".join(d.strftime("%d-%b-%Y") for d in dates)
+                   + ". Each row keeps its own date unless you override it below.")
+    if detected:
+        st.write(f"Date found in the files: **{detected.strftime('%d-%b-%Y')}**")
+    else:
+        st.error("No date found in the files. Tick the box below and choose the date.")
+    other = st.checkbox("Use a different date for all rows", value=(detected is None))
+    override = None
+    if other:
+        override = st.date_input("Date to use", value=detected or dt.date.today(), format="DD/MM/YYYY")
+
+    st.subheader("3. Update the report")
+    go = st.button("Update report", type="primary", disabled=not table)
+    if go:
+        with st.spinner("Updating the report..."):
+            new, msgs, stats = cr.update_report(st.session_state["master"], parsed, override_date=override)
+        res = dict(msgs=msgs, data=new, name=None, saved=None, save_error=None)
+        if new is not None:
+            d = stats["date"]
+            res["name"] = f"Test Equity - Cash Application Specialist {d.strftime('%d-%b-%Y')}.xlsx"
+            if GH:
+                with st.spinner("Saving back to GitHub (wait for the confirmation)..."):
+                    sha, err = gh_save(new, st.session_state["sha"], f"EOD update {d.isoformat()}")
+                if sha:
+                    st.session_state["sha"] = sha
+                    st.session_state["master"] = new
+                    res["saved"] = True
+                else:
+                    res["saved"] = False
+                    res["save_error"] = err
+            else:
+                st.session_state["master"] = new
+        st.session_state["result"] = res
+
+# ---------------------------------------------------------------- show the result
+res = st.session_state.get("result")
+if res:
+    st.divider()
+    for level, text in res["msgs"]:
+        if level == "error":
+            st.error(text)
+    if res["data"] is not None:
+        st.success("Report updated.")
+        if res["saved"] is True:
+            st.success("Saved back to GitHub. You can close this page after you download the file.")
+        elif res["saved"] is False:
+            st.error(f"The report was updated but NOT saved to GitHub ({res['save_error']}). "
+                     "Download it now, then upload it to GitHub by hand as report.xlsx. "
+                     "Do not load these files again until that is done.")
+        for level, text in res["msgs"]:
+            if level == "ok":
+                st.write(f":green[+] {text}")
+        for level, text in res["msgs"]:
+            if level == "warn":
+                st.warning(text)
+            elif level == "info":
+                st.info(text)
+        st.download_button("Download updated report", res["data"], file_name=res["name"],
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.caption("Excel recalculates the Daily, Weekly and Monthly sheets when you open the file. "
+                   "If Excel asks to save changes on closing, that is normal.")
+    else:
+        for level, text in res["msgs"]:
+            if level == "warn":
+                st.warning(text)

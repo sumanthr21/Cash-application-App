@@ -1,3 +1,3 @@
-streamlit>=1.35
-openpyxl>=3.1
-requests>=2.31
+streamlit
+requests
+openpyxl
